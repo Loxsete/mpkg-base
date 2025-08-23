@@ -10,11 +10,13 @@
 #include <time.h>
 
 #define CONFIG_FILE "/etc/mpkg.conf"
+#define LOG_FILE "/var/log/mpkg.log"
 char PKG_DB_PATH[256] = "/var/db/mpkg";
 char PKG_CACHE_PATH[256] = "/var/cache/mpkg";
 char PKG_REPO_URL[512] = "https://loxsete.github.io/mpkg-server/";
 
 extern int is_installed(const char *package_name);
+
 
 typedef struct {
     char name[256];
@@ -26,6 +28,7 @@ typedef struct {
     time_t install_time;
 } Package;
 
+int install_package(const char *package_name);
 int read_config() {
     FILE *f = fopen(CONFIG_FILE, "r");
     if (!f) {
@@ -193,7 +196,7 @@ int download_package(const char *package_name) {
 
     snprintf(url, sizeof(url), "%s/%s.tar.xz", PKG_REPO_URL, package_name);
     snprintf(cache_file, sizeof(cache_file), "%s/%s.tar.xz", PKG_CACHE_PATH, package_name);
-    snprintf(cmd, sizeof(cmd), "curl -L -f -o %s %s", cache_file, url);
+    snprintf(cmd, sizeof(cmd), "curl -L -f --progress-bar -o %s %s", cache_file, url);
 
     printf("Grabbing %s\n", package_name);
     int result = system(cmd);
@@ -225,6 +228,46 @@ static int copy_data(struct archive *ar, struct archive *aw) {
     }
 }
 
+int check_conflicts(const char *package_name) {
+    char files_file[512];
+    snprintf(files_file, sizeof(files_file), "%s/%s.files", PKG_DB_PATH, package_name);
+    FILE *new_files = fopen(files_file, "r");
+    if (!new_files) return 0;
+
+    char new_path[1024];
+    DIR *dir = opendir(PKG_DB_PATH);
+    struct dirent *entry;
+
+    while ((entry = readdir(dir))) {
+        if (strstr(entry->d_name, ".files") && !strstr(entry->d_name, package_name)) {
+            char other_file[512];
+            snprintf(other_file, sizeof(other_file), "%s/%s", PKG_DB_PATH, entry->d_name);
+            FILE *other = fopen(other_file, "r");
+            if (!other) continue;
+
+            char other_path[1024];
+            while (fgets(new_path, sizeof(new_path), new_files)) {
+                new_path[strcspn(new_path, "\n")] = 0;
+                rewind(other);
+                while (fgets(other_path, sizeof(other_path), other)) {
+                    other_path[strcspn(other_path, "\n")] = 0;
+                    if (strcmp(new_path, other_path) == 0) {
+                        printf("Conflict: %s already owned by another package\n", new_path);
+                        fclose(other);
+                        fclose(new_files);
+                        closedir(dir);
+                        return -1;
+                    }
+                }
+            }
+            fclose(other);
+        }
+    }
+    fclose(new_files);
+    closedir(dir);
+    return 0;
+}
+
 int extract_package(const char *package_name) {
     char archive_path[512];
     struct archive *a;
@@ -247,7 +290,7 @@ int extract_package(const char *package_name) {
         return -1;
     }
 
-    printf("Unpacking %s, \n", package_name);
+    printf("Unpacking %s\n", package_name);
     char files_log_path[512];
     FILE *files_log;
     
@@ -309,6 +352,15 @@ int extract_package(const char *package_name) {
     archive_write_free(ext);
 
     return 0;
+}
+
+void log_action(const char *action, const char *package_name, int status) {
+    FILE *log = fopen(LOG_FILE, "a");
+    if (!log) return;
+
+    time_t now = time(NULL);
+    fprintf(log, "[%s] %s %s: %s\n", ctime(&now), action, package_name, status == 0 ? "success" : "failed");
+    fclose(log);
 }
 
 int mark_installed(const char *package_name, Package *pkg) {
@@ -378,6 +430,113 @@ Package* read_installed_package(const char *package_name) {
     return pkg;
 }
 
+int sync_repository() {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "curl -L -o %s/repo.db %s/repo.db", PKG_DB_PATH, PKG_REPO_URL);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Failed to sync repo\n");
+        return -1;
+    }
+    log_action("sync", "repository", 0);
+    printf("Repository synced\n");
+    return 0;
+}
+
+int update_package(const char *package_name) {
+    Package *local_pkg = read_installed_package(package_name);
+    if (!local_pkg) {
+        printf("%s not installed\n", package_name);
+        return -1;
+    }
+
+    char repo_db[512];
+    snprintf(repo_db, sizeof(repo_db), "%s/repo.db", PKG_DB_PATH);
+    FILE *f = fopen(repo_db, "r");
+    if (!f) {
+        fprintf(stderr, "Can't open repo db: %s\n", strerror(errno));
+        free(local_pkg);
+        return -1;
+    }
+
+    char line[1024];
+    char repo_version[64] = "";
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = 0;
+        if (strncmp(line, "name=", 5) == 0 && strcmp(line + 5, package_name) == 0) {
+            while (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = 0;
+                if (strncmp(line, "version=", 8) == 0) {
+                    strncpy(repo_version, line + 8, sizeof(repo_version) - 1);
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    fclose(f);
+
+    if (strlen(repo_version) == 0) {
+        printf("No update info for %s\n", package_name);
+        free(local_pkg);
+        return -1;
+    }
+
+    if (strcmp(local_pkg->version, repo_version) == 0) {
+        printf("%s is up to date\n", package_name);
+        free(local_pkg);
+        return 0;
+    }
+
+    printf("Updating %s from %s to %s\n", package_name, local_pkg->version, repo_version);
+    free(local_pkg);
+
+    if (download_package(package_name) != 0) {
+        log_action("update", package_name, -1);
+        return -1;
+    }
+
+    char cache_file[512];
+    snprintf(cache_file, sizeof(cache_file), "%s/%s.tar.xz", PKG_CACHE_PATH, package_name);
+    
+    Package *pkg = read_package_info(cache_file);
+    if (!pkg) {
+        log_action("update", package_name, -1);
+        return -1;
+    }
+
+    if (check_conflicts(package_name) != 0) {
+        free(pkg);
+        log_action("update", package_name, -1);
+        return -1;
+    }
+
+    if (extract_package(package_name) != 0) {
+        free(pkg);
+        log_action("update", package_name, -1);
+        return -1;
+    }
+
+    mark_installed(package_name, pkg);
+    log_action("update", package_name, 0);
+    printf("%s updated\n", package_name);
+    free(pkg);
+    return 0;
+}
+
+int install_multiple_packages(int count, char *packages[]) {
+    int errors = 0;
+    for (int i = 0; i < count; i++) {
+        if (install_package(packages[i]) != 0) {
+            fprintf(stderr, "Failed to install %s\n", packages[i]);
+            log_action("install", packages[i], -1);
+            errors++;
+        } else {
+            log_action("install", packages[i], 0);
+        }
+    }
+    return errors;
+}
+
 int install_package(const char *package_name) {
     if (is_installed(package_name)) {
         printf("%s is already installed\n", package_name);
@@ -388,6 +547,7 @@ int install_package(const char *package_name) {
 
     if (download_package(package_name) != 0) {
         fprintf(stderr, "Download for %s\n", package_name);
+        log_action("install", package_name, -1);
         return -1;
     }
 
@@ -410,14 +570,21 @@ int install_package(const char *package_name) {
         }
     }
 
+    if (check_conflicts(package_name) != 0) {
+        if (pkg) free(pkg);
+        log_action("install", package_name, -1);
+        return -1;
+    }
+
     if (extract_package(package_name) != 0) {
         fprintf(stderr, "Extracting %s\n", package_name);
         if (pkg) free(pkg);
+        log_action("install", package_name, -1);
         return -1;
     }
 
     mark_installed(package_name, pkg);
-    
+    log_action("install", package_name, 0);
     printf("%s installed\n", package_name);
     
     if (pkg) free(pkg);
@@ -458,7 +625,7 @@ int remove_package(const char *package_name) {
         }
         fclose(f);
         
-        printf("Cleanup: %d files trashed %d\n", files_removed, files_failed);
+        printf("Cleanup: %d files trashed, %d failed\n", files_removed, files_failed);
         
         if (unlink(files_file) != 0) {
             printf("Warning: Couldn't delete files list: %s\n", strerror(errno));
@@ -472,6 +639,7 @@ int remove_package(const char *package_name) {
         printf("Warning: Couldn't remove install record: %s\n", strerror(errno));
     }
 
+    log_action("remove", package_name, 0);
     printf("%s is gone, baby, gone\n", package_name);
     return 0;
 }
@@ -508,6 +676,64 @@ void list_installed() {
     }
 
     closedir(dir);
+}
+
+void search_packages(const char *query) {
+    DIR *dir = opendir(PKG_DB_PATH);
+    if (!dir) {
+        fprintf(stderr, "Can't open dir: %s\n", strerror(errno));
+        return;
+    }
+
+    printf("Searching for '%s':\n", query);
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (strstr(entry->d_name, ".installed") && strstr(entry->d_name, query)) {
+            char pkg_name[256];
+            strncpy(pkg_name, entry->d_name, sizeof(pkg_name) - 1);
+            pkg_name[sizeof(pkg_name) - 1] = '\0';
+            char *dot = strstr(pkg_name, ".installed");
+            if (dot) *dot = '\0';
+            Package *pkg = read_installed_package(pkg_name);
+            if (pkg) {
+                printf("  %s-%s (%s)\n", pkg->name, pkg->version, pkg->description);
+                free(pkg);
+            } else {
+                printf("  %s\n", pkg_name);
+            }
+        }
+    }
+    closedir(dir);
+
+    char repo_db[512];
+    snprintf(repo_db, sizeof(repo_db), "%s/repo.db", PKG_DB_PATH);
+    FILE *f = fopen(repo_db, "r");
+    if (!f) return;
+
+    char line[1024];
+    char pkg_name[256];
+    char version[64];
+    char description[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = 0;
+        if (strncmp(line, "name=", 5) == 0 && strstr(line + 5, query)) {
+            strncpy(pkg_name, line + 5, sizeof(pkg_name) - 1);
+            pkg_name[sizeof(pkg_name) - 1] = '\0';
+            version[0] = '\0';
+            description[0] = '\0';
+            while (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = 0;
+                if (strncmp(line, "version=", 8) == 0) {
+                    strncpy(version, line + 8, sizeof(version) - 1);
+                } else if (strncmp(line, "description=", 12) == 0) {
+                    strncpy(description, line + 12, sizeof(description) - 1);
+                }
+                if (strlen(version) > 0 && strlen(description) > 0) break;
+            }
+            printf("  %s-%s (%s) [repo]\n", pkg_name, version, description);
+        }
+    }
+    fclose(f);
 }
 
 void show_package_info(const char *package_name) {
@@ -551,9 +777,6 @@ void show_package_info(const char *package_name) {
                 count++;
             }
         }
-        if (!feof(f)) {
-            
-        }
         fclose(f);
     }
     
@@ -564,10 +787,12 @@ int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: mpkg <command> [package]\n");
         printf("Commands:\n");
-        printf("  install <package>  - install package\n");
+        printf("  install <package>  - install package(s)\n");
         printf("  remove <package>   - remove package\n");
         printf("  list               - list installed packages\n");
         printf("  info <package>     - show package info\n");
+        printf("  update [package]   - update all or specific package\n");
+        printf("  search <query>     - search packages\n");
         return 1;
     }
 
@@ -578,10 +803,10 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "install") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Please specify a package name to install\n");
+            fprintf(stderr, "Please specify at least one package to install\n");
             return 1;
         }
-        return install_package(argv[2]);
+        return install_multiple_packages(argc - 2, &argv[2]);
     }
 
     if (strcmp(argv[1], "remove") == 0) {
@@ -603,6 +828,22 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         show_package_info(argv[2]);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "update") == 0) {
+        if (argc < 3) {
+            return sync_repository();
+        }
+        return update_package(argv[2]);
+    }
+
+    if (strcmp(argv[1], "search") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Please specify a search query\n");
+            return 1;
+        }
+        search_packages(argv[2]);
         return 0;
     }
 
